@@ -70,9 +70,70 @@ Update `wrangler.jsonc` to reference your Dockerfile:
 
 When you run `wrangler dev` or `wrangler deploy`, Wrangler automatically builds your Docker image and pushes it to Cloudflare's container registry. You don't need to manually build or publish images.
 
-## Custom startup scripts
+## Using the standalone binary with any Docker image
 
-Run services automatically when the container starts by creating a custom startup script:
+Add sandbox capabilities to any Docker image by copying the standalone binary:
+
+```dockerfile title="Dockerfile"
+FROM python:3.11-slim
+
+# Copy the sandbox binary from the official image
+COPY --from=docker.io/cloudflare/sandbox:0.3.3 /container-server/sandbox /sandbox
+
+# Install your dependencies
+RUN pip install fastapi uvicorn
+
+# Copy your application
+COPY . /app
+
+# Set the sandbox binary as entrypoint
+ENTRYPOINT ["/sandbox"]
+
+# Optional: run your application when container starts
+CMD ["python", "/app/main.py"]
+```
+
+The `/sandbox` binary starts the HTTP API server on port 3000, then executes your `CMD` as a child process. Your application runs alongside the sandbox API, enabling code execution via the SDK while your services remain operational.
+
+### How it works
+
+- The `ENTRYPOINT` starts the sandbox API server
+- Your `CMD` runs as a child process with signal forwarding
+- Both the sandbox API and your application run concurrently
+- If your `CMD` exits successfully, the sandbox API continues running
+- Signals (SIGTERM, SIGINT) are forwarded to your application
+
+### Using arbitrary base images
+
+```dockerfile title="Dockerfile"
+FROM node:20-alpine
+
+COPY --from=docker.io/cloudflare/sandbox:0.3.3 /container-server/sandbox /sandbox
+
+RUN npm install -g express
+
+COPY server.js /app/server.js
+
+ENTRYPOINT ["/sandbox"]
+CMD ["node", "/app/server.js"]
+```
+
+```dockerfile title="Dockerfile"
+FROM golang:1.21
+
+COPY --from=docker.io/cloudflare/sandbox:0.3.3 /container-server/sandbox /sandbox
+
+WORKDIR /app
+COPY . .
+RUN go build -o api-server
+
+ENTRYPOINT ["/sandbox"]
+CMD ["/app/api-server"]
+```
+
+## Custom startup scripts (legacy)
+
+For backwards compatibility, you can still use custom startup scripts:
 
 ```dockerfile title="Dockerfile"
 FROM docker.io/cloudflare/sandbox:0.3.3
@@ -80,6 +141,8 @@ FROM docker.io/cloudflare/sandbox:0.3.3
 COPY my-app.js /workspace/my-app.js
 COPY startup.sh /workspace/startup.sh
 RUN chmod +x /workspace/startup.sh
+
+ENTRYPOINT ["/sandbox"]
 CMD ["/workspace/startup.sh"]
 ```
 
@@ -89,11 +152,13 @@ CMD ["/workspace/startup.sh"]
 # Start your services in the background
 node /workspace/my-app.js &
 
-# Must end with this command
+# Legacy: explicitly start the API server
 exec bun /container-server/dist/index.js
 ```
 
-Your startup script must end with `exec bun /container-server/dist/index.js` to start the SDK's control plane.
+:::note
+When using the `/sandbox` binary as the entrypoint, you do not need to explicitly call `bun /container-server/dist/index.js`. The binary automatically starts the API server before executing your `CMD`. The explicit call is only needed for backwards compatibility with older startup patterns.
+:::
 
 ### Multiple services
 
@@ -105,7 +170,8 @@ until redis-cli ping; do sleep 1; done
 
 node /workspace/api-server.js &
 
-exec bun /container-server/dist/index.js
+# Keep container alive (API server already started by /sandbox binary)
+wait
 ```
 
 ## Related resources
