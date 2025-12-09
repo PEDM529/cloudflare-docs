@@ -1,0 +1,525 @@
+---
+title: Use OpenCode integration
+pcx_content_type: how-to
+sidebar:
+  order: 12
+description: Run OpenCode AI coding agents inside Sandbox containers.
+---
+
+import { TypeScriptExample, PackageManagers } from "~/components";
+
+This guide shows you how to run OpenCode AI coding agents inside Sandbox containers using either the web UI or programmatic SDK access.
+
+## When to use OpenCode integration
+
+Use OpenCode integration for:
+
+- **AI coding agents** - Let AI write, edit, and execute code in isolated environments
+- **Code generation** - Generate and test code with AI assistance
+- **Interactive development** - Use the OpenCode web UI for browser-based coding
+- **Automated workflows** - Programmatically control OpenCode via SDK for automation
+
+## Prerequisites
+
+1. A Cloudflare account with Sandbox SDK access
+2. Custom Docker image with OpenCode CLI installed
+3. API keys for AI providers (Anthropic, OpenAI, etc.)
+
+## Choose your approach
+
+OpenCode integration supports two usage patterns:
+
+| Approach | Best for | SDK required |
+|----------|----------|--------------|
+| **Web UI proxy** | Interactive browser-based coding, manual development | No |
+| **Programmatic SDK** | Automation, integrations, AI workflows | Yes |
+
+## Web UI proxy
+
+The web UI proxy approach gives users a full browser-based OpenCode experience.
+
+### Step 1: Create a custom Docker image
+
+Create a `Dockerfile` that extends the Sandbox base image with OpenCode:
+
+```dockerfile title="Dockerfile"
+FROM docker.io/cloudflare/sandbox:latest
+
+# Add OpenCode to PATH
+ENV PATH="/root/.opencode/bin:${PATH}"
+
+# Install OpenCode CLI
+RUN curl -fsSL https://opencode.ai/install -o /tmp/install-opencode.sh \
+    && bash /tmp/install-opencode.sh \
+    && rm /tmp/install-opencode.sh \
+    && opencode --version
+
+# Clone a sample project for immediate use
+RUN git clone --depth 1 https://github.com/cloudflare/agents.git /home/user/agents
+
+WORKDIR /home/user/agents
+
+# Expose OpenCode server port
+EXPOSE 4096
+```
+
+Build and push the image:
+
+```sh
+docker build -t your-registry/opencode-sandbox:latest .
+docker push your-registry/opencode-sandbox:latest
+```
+
+### Step 2: Configure wrangler
+
+Update your `wrangler.jsonc` to use the custom image:
+
+```jsonc title="wrangler.jsonc"
+{
+  "name": "opencode-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-01-01",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "Sandbox",
+        "class_name": "Sandbox",
+        "script_name": "opencode-worker",
+        "environment": "production"
+      }
+    ]
+  },
+  "sandbox": {
+    "container": {
+      "image": "your-registry/opencode-sandbox:latest"
+    }
+  }
+}
+```
+
+### Step 3: Create the worker
+
+Create a worker that proxies requests to OpenCode:
+
+<TypeScriptExample>
+```
+import { getSandbox } from '@cloudflare/sandbox';
+import {
+  createOpencodeServer,
+  proxyToOpencode
+} from '@cloudflare/sandbox/opencode';
+
+export { Sandbox } from '@cloudflare/sandbox';
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const sandbox = getSandbox(env.Sandbox, 'opencode');
+
+    // Start OpenCode server (or reuse existing)
+    const server = await createOpencodeServer(sandbox, {
+      directory: '/home/user/agents',
+      config: {
+        provider: {
+          anthropic: {
+            options: {
+              apiKey: env.ANTHROPIC_API_KEY
+            }
+          }
+        }
+      }
+    });
+
+    // Proxy all requests to OpenCode web UI
+    return proxyToOpencode(request, sandbox, server);
+  }
+};
+```
+</TypeScriptExample>
+
+### Step 4: Set environment variables
+
+Create a `.dev.vars` file for local development:
+
+```sh title=".dev.vars"
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+For production, set secrets using Wrangler:
+
+```sh
+wrangler secret put ANTHROPIC_API_KEY
+```
+
+### Step 5: Run and access
+
+Start the development server:
+
+<PackageManagers
+  type="run"
+  pkg="wrangler"
+  args="dev"
+/>
+
+Open your browser to `http://localhost:8787` to access the OpenCode web UI.
+
+## Programmatic SDK access
+
+The programmatic approach gives you full control over OpenCode through its typed SDK client.
+
+### Step 1: Install dependencies
+
+Install the OpenCode SDK:
+
+<PackageManagers
+  type="install"
+  pkg="@opencode-ai/sdk"
+/>
+
+### Step 2: Set up Docker and wrangler
+
+Follow the same Docker image and wrangler configuration steps as the web UI approach above.
+
+### Step 3: Create the worker
+
+Create a worker that uses the OpenCode SDK:
+
+<TypeScriptExample>
+```
+import { getSandbox } from '@cloudflare/sandbox';
+import { createOpencode } from '@cloudflare/sandbox/opencode';
+import type { OpencodeClient } from '@opencode-ai/sdk';
+
+export { Sandbox } from '@cloudflare/sandbox';
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const sandbox = getSandbox(env.Sandbox, 'my-agent');
+
+    // Clone a repo for the agent to work with
+    await sandbox.gitCheckout('https://github.com/cloudflare/agents.git', {
+      targetDir: '/home/user/agents'
+    });
+
+    // Get typed SDK client
+    const { client, server } = await createOpencode<OpencodeClient>(sandbox, {
+      directory: '/home/user/agents',
+      config: {
+        provider: {
+          anthropic: {
+            options: {
+              apiKey: env.ANTHROPIC_API_KEY
+            }
+          }
+        }
+      }
+    });
+
+    // Create a session
+    const session = await client.session.create({
+      body: { title: 'Analyze Repository' },
+      query: { directory: '/home/user/agents' }
+    });
+
+    if (!session.data) {
+      return Response.json({ error: 'Failed to create session' }, { status: 500 });
+    }
+
+    // Send a prompt
+    const result = await client.session.prompt({
+      path: { id: session.data.id },
+      query: { directory: '/home/user/agents' },
+      body: {
+        model: {
+          providerID: 'anthropic',
+          modelID: 'claude-haiku-4-5'
+        },
+        parts: [
+          {
+            type: 'text',
+            text: 'Summarize the README.md file in 2-3 sentences'
+          }
+        ]
+      }
+    });
+
+    // Extract text response
+    const parts = result.data?.parts ?? [];
+    const textPart = parts.find((p: { type: string }) => p.type === 'text') as
+      | { text?: string }
+      | undefined;
+
+    return new Response(textPart?.text ?? 'No response', {
+      headers: { 'Content-Type': 'text/plain' }
+    });
+  }
+};
+```
+</TypeScriptExample>
+
+### Step 4: Handle multiple requests
+
+The OpenCode integration automatically reuses existing server processes when multiple requests target the same port:
+
+<TypeScriptExample>
+```
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const sandbox = getSandbox(env.Sandbox, 'opencode');
+
+    // Server will be reused across requests to the same sandbox
+    const { client, server } = await createOpencode(sandbox, {
+      directory: '/home/user/agents',
+      config: {
+        provider: {
+          anthropic: {
+            options: {
+              apiKey: env.ANTHROPIC_API_KEY
+            }
+          }
+        }
+      }
+    });
+
+    // Route different paths to different operations
+    if (url.pathname === '/analyze') {
+      const session = await client.session.create({
+        body: { title: 'Analysis Task' }
+      });
+      // ... handle analysis
+    } else if (url.pathname === '/generate') {
+      const session = await client.session.create({
+        body: { title: 'Generation Task' }
+      });
+      // ... handle generation
+    }
+
+    return new Response('Done');
+  }
+};
+```
+</TypeScriptExample>
+
+## Configuration options
+
+### Multiple AI providers
+
+Configure multiple providers for OpenCode to use:
+
+<TypeScriptExample>
+```
+const { client, server } = await createOpencode(sandbox, {
+  config: {
+    provider: {
+      anthropic: {
+        options: {
+          apiKey: env.ANTHROPIC_API_KEY
+        }
+      },
+      openai: {
+        options: {
+          apiKey: env.OPENAI_API_KEY
+        }
+      }
+    }
+  }
+});
+```
+</TypeScriptExample>
+
+### Custom port
+
+Use a different port if 4096 is already in use:
+
+<TypeScriptExample>
+```
+const server = await createOpencodeServer(sandbox, {
+  port: 8080,
+  directory: '/home/user/project',
+  config: {
+    provider: {
+      anthropic: {
+        options: {
+          apiKey: env.ANTHROPIC_API_KEY
+        }
+      }
+    }
+  }
+});
+```
+</TypeScriptExample>
+
+### Working directory
+
+Specify the directory where OpenCode should operate:
+
+<TypeScriptExample>
+```
+const { client, server } = await createOpencode(sandbox, {
+  directory: '/home/user/my-project',
+  config: {
+    provider: {
+      anthropic: {
+        options: {
+          apiKey: env.ANTHROPIC_API_KEY
+        }
+      }
+    }
+  }
+});
+```
+</TypeScriptExample>
+
+## Error handling
+
+Handle OpenCode startup failures gracefully:
+
+<TypeScriptExample>
+```
+import { OpencodeStartupError } from '@cloudflare/sandbox/opencode';
+
+try {
+  const { client, server } = await createOpencode(sandbox, {
+    config: {
+      provider: {
+        anthropic: {
+          options: {
+            apiKey: env.ANTHROPIC_API_KEY
+          }
+        }
+      }
+    }
+  });
+
+  // Use OpenCode...
+} catch (error) {
+  if (error instanceof OpencodeStartupError) {
+    console.error('OpenCode failed to start');
+    console.error('Port:', error.context.port);
+    console.error('Command:', error.context.command);
+    console.error('Server logs:', error.context.stderr);
+
+    return Response.json(
+      {
+        error: 'OpenCode server failed to start',
+        details: error.message
+      },
+      { status: 500 }
+    );
+  }
+
+  throw error;
+}
+```
+</TypeScriptExample>
+
+## Best practices
+
+### Reuse server instances
+
+The integration automatically reuses existing OpenCode servers on the same port, reducing startup overhead:
+
+<TypeScriptExample>
+```
+// First request: starts new server
+const { client: client1 } = await createOpencode(sandbox, { port: 4096 });
+
+// Second request: reuses existing server
+const { client: client2 } = await createOpencode(sandbox, { port: 4096 });
+```
+</TypeScriptExample>
+
+### Clean up when done
+
+Close the server when you no longer need it:
+
+<TypeScriptExample>
+```
+const { client, server } = await createOpencode(sandbox, {
+  directory: '/home/user/project',
+  config: {
+    provider: {
+      anthropic: {
+        options: {
+          apiKey: env.ANTHROPIC_API_KEY
+        }
+      }
+    }
+  }
+});
+
+try {
+  // Use OpenCode...
+  const session = await client.session.create({
+    body: { title: 'Task' }
+  });
+} finally {
+  await server.close();
+}
+```
+</TypeScriptExample>
+
+### Handle concurrent requests
+
+For high-concurrency scenarios, consider using unique sandbox names per user or session:
+
+<TypeScriptExample>
+```
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // Use user ID or session ID in sandbox name for isolation
+    const userId = request.headers.get('X-User-ID') ?? 'anonymous';
+    const sandbox = getSandbox(env.Sandbox, `opencode-${userId}`);
+
+    const { client, server } = await createOpencode(sandbox, {
+      directory: '/home/user/workspace',
+      config: {
+        provider: {
+          anthropic: {
+            options: {
+              apiKey: env.ANTHROPIC_API_KEY
+            }
+          }
+        }
+      }
+    });
+
+    // Each user gets their own isolated OpenCode instance
+    // ...
+  }
+};
+```
+</TypeScriptExample>
+
+## Troubleshooting
+
+### Server fails to start
+
+If the OpenCode server fails to start, check:
+
+1. **Docker image** - Ensure OpenCode CLI is installed correctly
+2. **API keys** - Verify API keys are set and valid
+3. **Port conflicts** - Try a different port if 4096 is in use
+4. **Container logs** - Check stderr output in error messages
+
+### Web UI shows connection errors
+
+If the web UI cannot connect to the API:
+
+1. Ensure you are using `proxyToOpencode()` which handles the `?url=` parameter
+2. Check that the server port matches between `createOpencodeServer()` and `proxyToOpencode()`
+3. Verify the container EXPOSE directive includes the port
+
+### SDK peer dependency errors
+
+If you see errors about `@opencode-ai/sdk` not found:
+
+1. Install the SDK: `npm install @opencode-ai/sdk`
+2. Or use `createOpencodeServer()` + `proxyToOpencode()` which do not require the SDK
+
+## Related resources
+
+- [OpenCode Integration API](/sandbox/api/opencode/) - API reference
+- [Background Processes](/sandbox/guides/background-processes/) - Process management
+- [Git Workflows](/sandbox/guides/git-workflows/) - Clone repositories for OpenCode
+- [Preview URLs](/sandbox/concepts/preview-urls/) - Expose services to the internet
